@@ -1,6 +1,7 @@
 package txncache
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -11,7 +12,9 @@ import (
 var count sync.Map
 
 func TestCache(t *testing.T) {
-	cache := NewTxnCache()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cache, _ := NewTxnCache(ctx, GetValue, GetMultiValue)
 	var wg sync.WaitGroup
 	rand.Seed(time.Now().Unix())
 	keyCount := rand.Intn(1000)
@@ -26,7 +29,7 @@ func TestCache(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res := cache.GetAllParallel(keys, GetValue)
+			res := cache.MultiGetAll(keys)
 			for k, v := range res {
 				fmt.Printf("%v-%v\n", k, v)
 			}
@@ -38,7 +41,7 @@ func TestCache(t *testing.T) {
 		size++
 		return true
 	})
-	if size < keyCount {
+	if size > keyCount {
 		t.Errorf("Fetch called more than expected time, count: %v", size)
 	} else {
 		t.Logf("Fetch count: %v", size)
@@ -55,4 +58,14 @@ func GetValue(key Key) Value {
 	count.Store(fmt.Sprintf("%v-%v", key, rand.Intn(10000)), true)
 	fmt.Printf("%v key fetch\n", key)
 	return fmt.Sprintf("v#%v", key)
+}
+
+func GetMultiValue(keys []Key) map[Key]Value {
+	res := make(map[Key]Value)
+	for _, key := range keys {
+		fmt.Printf("%v key fetch\n", key)
+		count.Store(fmt.Sprintf("%v-%v", key, rand.Intn(10000)), true)
+		res[key] = fmt.Sprintf("v#%v", key)
+	}
+	return res
 }

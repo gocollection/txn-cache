@@ -7,9 +7,13 @@ type Key interface {
 type Value interface{}
 
 type Cache interface {
-	Get(key Key, fetch Fetch) Value
-	GetAll(keys []Key, fetch Fetch) map[Key]Value
-	GetAllParallel(keys []Key, fetch Fetch) map[Key]Value
+	Get(key Key) Value
+	GetAll(keys []Key) map[Key]Value
+	GetAllParallel(keys []Key) map[Key]Value
+	MultiGetAll(keys []Key) map[Key]Value
+	MultiGetAllBatched(keys []Key, batchSize int32) map[Key]Value
 }
 
 type Fetch func(Key) Value
+
+type MultiFetch func([]Key) map[Key]Value
