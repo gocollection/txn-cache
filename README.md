@@ -23,16 +23,24 @@ Value can be anything -
 type Value interface{}
 ```
 
-Fetch function should follow the signature -
+Either a *Fetch* or *MultiFetch* function or both should be provided.
+Fetch function should follow the signature, this function returns value for a single input key -
 ```go
 type Fetch func(Key) Value
 ```
 
-That's all
+It's good to have a *MultiFetch* function which should have following signature. If *MultiFetch* is not provided, Fetch 
+will be used to create a MultiFetch function on the go.
+```go
+type MultiFetch func([]Key) map[Key]Value
+```
+
+Following example showcase the use case where multiple goroutines tries to fetch values of multiple keys at once,
+the keys are overlapping as well.
 
 ```go
 func main() {
-	cache := txncache.NewTxnCache()
+	cache, _ := txncache.NewCache(context.Background(), GetValue, GetMultiValue, 10)
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -44,7 +52,7 @@ func main() {
 		keys = append(keys, ZKey("k2"))
 		keys = append(keys, ZKey("k1"))
 
-		cache.GetAllParallel(keys, GetValue)
+		cache.MultiGet(keys)
 	}()
 
 	wg.Add(1)
@@ -56,14 +64,24 @@ func main() {
 		keys = append(keys, ZKey("k3"))
 		keys = append(keys, ZKey("k2"))
 
-		cache.GetAllParallel(keys, GetValue)
+		cache.MultiGet(keys)
 	}()
 	wg.Wait()
 	// k1, k2, k3 will be fetched only once
 }
 
 func GetValue(key txncache.Key) txncache.Value {
+	fmt.Println("key fetch ", key)
 	return fmt.Sprintf("val#%v", key)
+}
+
+func GetMultiValue(keys []txncache.Key) map[txncache.Key]txncache.Value {
+	res := make(map[txncache.Key]txncache.Value)
+	for _, key := range keys {
+		fmt.Println("key fetch ", key)
+		res[key] = fmt.Sprintf("v#%v", key)
+	}
+	return res
 }
 
 type ZKey string
@@ -71,5 +89,6 @@ type ZKey string
 func (k ZKey) Id() string {
 	return string(k)
 }
-
 ```
+
+For robust example checkout the test file.

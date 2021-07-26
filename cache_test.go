@@ -14,10 +14,10 @@ var count sync.Map
 func TestCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cache, _ := NewTxnCache(ctx, GetValue, GetMultiValue)
+	cache, _ := NewCache(ctx, GetValue, GetMultiValue, 10)
 	var wg sync.WaitGroup
 	rand.Seed(time.Now().Unix())
-	keyCount := rand.Intn(1000)
+	keyCount := rand.Intn(3000)
 	t.Logf("Max key count: %v", keyCount)
 	for i := 0; i < rand.Intn(100); i++ {
 		keys := make([]Key, 0)
@@ -29,7 +29,10 @@ func TestCache(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res := cache.MultiGetAll(keys)
+			res := cache.MultiGet(keys)
+			if len(res) != len(keys) {
+				t.Error("Less result fetched")
+			}
 			for k, v := range res {
 				fmt.Printf("%v-%v\n", k, v)
 			}
@@ -61,9 +64,10 @@ func GetValue(key Key) Value {
 }
 
 func GetMultiValue(keys []Key) map[Key]Value {
+	id := rand.Intn(1000)
 	res := make(map[Key]Value)
 	for _, key := range keys {
-		fmt.Printf("%v key fetch\n", key)
+		fmt.Printf("%v - %v key fetch\n", id, key)
 		count.Store(fmt.Sprintf("%v-%v", key, rand.Intn(10000)), true)
 		res[key] = fmt.Sprintf("v#%v", key)
 	}

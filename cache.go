@@ -3,6 +3,7 @@ package txncache
 import (
 	"context"
 	"fmt"
+	"github.com/saurav534/txn-cache/internal"
 	"sync"
 )
 
@@ -20,11 +21,16 @@ type keyWrap struct {
 }
 
 type keyValChan struct {
-	key Key
-	val chan Value
+	key    Key
+	val    chan Value
+	locked bool
 }
 
-func NewTxnCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch) (*TxnCache, error) {
+// NewCache gives an instance of TxnCache for given fetch & multiFetch functions
+// Fetch is the function to be used for value fetch of a single key
+// MultiFetch is the batched version of fetch function
+// batchSize should be passed greater than 0 if MultiFetch function is expected to be called in batch
+func NewCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch, batchSize int) (*TxnCache, error) {
 	if fetch == nil && multiFetch == nil {
 		return nil, fmt.Errorf("both fetch and multifetch can not be nil")
 	}
@@ -40,12 +46,16 @@ func NewTxnCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch) (*TxnC
 	if multiFetch == nil {
 		multiFetch = func(keys []Key) map[Key]Value {
 			var data sync.Map
+			var wg sync.WaitGroup
+			wg.Add(len(keys))
 			for _, key := range keys {
 				go func(k Key) {
+					defer wg.Done()
 					data.Store(k, fetch(k))
 				}(key)
 			}
 			res := make(map[Key]Value)
+			wg.Wait()
 			data.Range(func(key, value interface{}) bool {
 				res[key.(Key)] = value.(Value)
 				return true
@@ -63,6 +73,19 @@ func NewTxnCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch) (*TxnC
 	uniqueKeys := make([]Key, 0)
 	keysMap := make(map[string][]*keyWrap)
 	resMap := make(map[*keyWrap]chan Value)
+	execute := func() {
+		for k, v := range multiFetch(uniqueKeys) {
+			store.Store(k.Id(), v)
+			if kws, ok := keysMap[k.Id()]; ok {
+				for _, kw := range kws {
+					resMap[kw] <- v
+					delete(resMap, kw)
+				}
+				delete(keysMap, k.Id())
+			}
+		}
+		uniqueKeys = nil
+	}
 	var mutex sync.Mutex
 	go func() {
 		for {
@@ -70,6 +93,11 @@ func NewTxnCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch) (*TxnC
 			case kr := <-multiKeyChan:
 				{
 					mutex.Lock()
+					if value, ok := store.Load(kr.key.Id()); ok {
+						kr.val <- value
+						mutex.Unlock()
+						continue
+					}
 					kw := &keyWrap{kr.key}
 					if keys, ok := keysMap[kr.key.Id()]; ok {
 						keysMap[kr.key.Id()] = append(keys, kw)
@@ -78,22 +106,15 @@ func NewTxnCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch) (*TxnC
 						keysMap[kr.key.Id()] = []*keyWrap{kw}
 					}
 					resMap[kw] = kr.val
+					if batchSize > 0 && batchSize == len(uniqueKeys) {
+						execute()
+					}
 					mutex.Unlock()
 				}
 			case <-execMultiFetch:
 				{
 					mutex.Lock()
-					for k, v := range multiFetch(uniqueKeys) {
-						store.Store(k.Id(), v)
-						if kws, ok := keysMap[k.Id()]; ok {
-							for _, kw := range kws {
-								resMap[kw] <- v
-								delete(resMap, kw)
-							}
-							delete(keysMap, k.Id())
-						}
-					}
-					uniqueKeys = nil
+					execute()
 					mutex.Unlock()
 				}
 			case <-ctx.Done():
@@ -132,57 +153,27 @@ func (tc *TxnCache) Get(key Key) Value {
 	}
 }
 
-func (tc *TxnCache) GetAll(keys []Key) map[Key]Value {
-	res := make(map[Key]Value)
-	for _, key := range keys {
-		res[key] = tc.Get(key)
-	}
-	return res
-}
-
-func (tc *TxnCache) GetAllParallel(keys []Key) map[Key]Value {
-	var data sync.Map
-	var wg sync.WaitGroup
-	for _, key := range keys {
-		wg.Add(1)
-		go func(k Key) {
-			defer wg.Done()
-			data.Store(k, tc.Get(k))
-		}(key)
-	}
-	res := make(map[Key]Value)
-	wg.Wait()
-	data.Range(func(key, value interface{}) bool {
-		res[key.(Key)] = value.(Value)
-		return true
-	})
-	return res
-}
-
-func (tc *TxnCache) MultiGetAll(keys []Key) map[Key]Value {
+func (tc *TxnCache) MultiGet(keys []Key) map[Key]Value {
 	var data sync.Map
 	var wg sync.WaitGroup
 	var keyPush sync.WaitGroup
 	for _, key := range keys {
-		//if value, ok := tc.store.Load(key.Id()); ok {
-		//	data.Store(key, value)
-		//	continue
-		//}
+		if value, ok := tc.store.Load(key.Id()); ok {
+			data.Store(key, value)
+			continue
+		}
 		wg.Add(1)
-		lock, _ := tc.lock.LoadOrStore(key.Id(), &sync.Mutex{})
-		mutex := lock.(*sync.Mutex)
-		mutex.Lock()
+		lock, _ := tc.lock.LoadOrStore(key.Id(), internal.NewMutex())
+		mutex := lock.(*internal.Mutex)
+		locked := mutex.TryLock()
 		keyPush.Add(1)
 		go func(k Key) {
 			defer wg.Done()
-			defer mutex.Unlock()
-			if value, ok := tc.store.Load(k.Id()); ok {
-				data.Store(k, value)
-				keyPush.Done()
-				return
+			if locked {
+				defer mutex.Unlock()
 			}
 			valChan := make(chan Value)
-			tc.multiKeyChan <- &keyValChan{k, valChan}
+			tc.multiKeyChan <- &keyValChan{k, valChan, locked}
 			keyPush.Done()
 			val := <-valChan
 			data.Store(k, val)
@@ -198,8 +189,4 @@ func (tc *TxnCache) MultiGetAll(keys []Key) map[Key]Value {
 		return true
 	})
 	return res
-}
-
-func (tc *TxnCache) MultiGetAllBatched(keys []Key, batchSize int32) map[Key]Value {
-	panic("implement me")
 }
