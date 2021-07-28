@@ -40,7 +40,7 @@ the keys are overlapping as well.
 
 ```go
 func main() {
-	cache, _ := txncache.NewCache(context.Background(), GetValue, GetMultiValue, 10)
+	cache, _ := txncache.NewCache(GetValue, GetMultiValue, 10)
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -92,3 +92,17 @@ func (k ZKey) Id() string {
 ```
 
 For robust example checkout the test file.
+
+## Dump & Pre Loading
+One might need to reuse the current cache store in the next transaction as well. So **GetAll()** can be used to take
+the dump of current cache storage. Client can store it somewhere and case use it later to preload.
+**Preload(map[string]Value)** preload a cache with given key id and value map and do not call fetch function for those keys
+
+## Default Value
+Ideally the *Fetch* & *MultiFetch* function should return value for all the provided keys. However if the implementation 
+does not guarantee that, one should provide a default value to be used as return value of such keys. This is compulsory to
+avoid deadlock situation while waiting for these keys.
+
+## Cache cleanup
+Cache should be closed post usage to avoid leaks, Close up can be done explicitly by calling **Close()** function or
+can be closed along with ctx cancellation by using **CloseWithCtx(context.Context)** function.

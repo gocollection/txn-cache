@@ -7,13 +7,16 @@ import (
 	"sync"
 )
 
-type TxnCache struct {
+type txnCache struct {
 	store          *sync.Map
 	lock           *sync.Map
 	fetch          Fetch
 	multiFetch     MultiFetch
+	defVal         Value
+	batchSize      int
 	multiKeyChan   chan *keyValChan
 	execMultiFetch chan bool
+	closeChan      chan bool
 }
 
 type keyWrap struct {
@@ -26,11 +29,11 @@ type keyValChan struct {
 	locked bool
 }
 
-// NewCache gives an instance of TxnCache for given fetch & multiFetch functions
+// NewCache gives an instance of txnCache for given fetch & multiFetch functions
 // Fetch is the function to be used for value fetch of a single key
 // MultiFetch is the batched version of fetch function
 // batchSize should be passed greater than 0 if MultiFetch function is expected to be called in batch
-func NewCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch, batchSize int) (*TxnCache, error) {
+func NewCache(fetch Fetch, multiFetch MultiFetch, batchSize int) (Cache, error) {
 	if fetch == nil && multiFetch == nil {
 		return nil, fmt.Errorf("both fetch and multifetch can not be nil")
 	}
@@ -66,22 +69,49 @@ func NewCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch, batchSize
 
 	multiKeyChan := make(chan *keyValChan)
 	execMultiFetch := make(chan bool)
+	closeChan := make(chan bool)
 
 	store := &sync.Map{}
 	lock := &sync.Map{}
 
+	cache := &txnCache{
+		store:          store,
+		lock:           lock,
+		fetch:          fetch,
+		multiFetch:     multiFetch,
+		multiKeyChan:   multiKeyChan,
+		defVal:         struct{}{},
+		batchSize:      batchSize,
+		execMultiFetch: execMultiFetch,
+		closeChan:      closeChan,
+	}
+	cache.setup()
+	return cache, nil
+}
+
+func (tc *txnCache) setup() {
 	uniqueKeys := make([]Key, 0)
 	keysMap := make(map[string][]*keyWrap)
 	resMap := make(map[*keyWrap]chan Value)
 	execute := func() {
-		for k, v := range multiFetch(uniqueKeys) {
-			store.Store(k.Id(), v)
-			if kws, ok := keysMap[k.Id()]; ok {
+		mf := tc.multiFetch(uniqueKeys)
+		for _, k := range uniqueKeys {
+			v := mf[k]
+			// if fetch function do not return any value for a key
+			// ideally fetch function should handle this and return a
+			// suitable value of such keys
+			// default values are not cached
+			if v == nil {
+				v = tc.defVal
+			} else {
+				tc.store.Store(k.ID(), v)
+			}
+			if kws, ok := keysMap[k.ID()]; ok {
 				for _, kw := range kws {
 					resMap[kw] <- v
 					delete(resMap, kw)
 				}
-				delete(keysMap, k.Id())
+				delete(keysMap, k.ID())
 			}
 		}
 		uniqueKeys = nil
@@ -90,80 +120,75 @@ func NewCache(ctx context.Context, fetch Fetch, multiFetch MultiFetch, batchSize
 	go func() {
 		for {
 			select {
-			case kr := <-multiKeyChan:
+			case kr := <-tc.multiKeyChan:
 				{
 					mutex.Lock()
-					if value, ok := store.Load(kr.key.Id()); ok {
+					if value, ok := tc.store.Load(kr.key.ID()); ok {
 						kr.val <- value
 						mutex.Unlock()
 						continue
 					}
 					kw := &keyWrap{kr.key}
-					if keys, ok := keysMap[kr.key.Id()]; ok {
-						keysMap[kr.key.Id()] = append(keys, kw)
+					if keys, ok := keysMap[kr.key.ID()]; ok {
+						keysMap[kr.key.ID()] = append(keys, kw)
 					} else {
 						uniqueKeys = append(uniqueKeys, kr.key)
-						keysMap[kr.key.Id()] = []*keyWrap{kw}
+						keysMap[kr.key.ID()] = []*keyWrap{kw}
 					}
 					resMap[kw] = kr.val
-					if batchSize > 0 && batchSize == len(uniqueKeys) {
+					if tc.batchSize > 0 && tc.batchSize == len(uniqueKeys) {
 						execute()
 					}
 					mutex.Unlock()
 				}
-			case <-execMultiFetch:
+			case <-tc.execMultiFetch:
 				{
 					mutex.Lock()
 					execute()
 					mutex.Unlock()
 				}
-			case <-ctx.Done():
+			case <-tc.closeChan:
 				{
-					close(multiKeyChan)
-					close(execMultiFetch)
+					close(tc.multiKeyChan)
+					close(tc.execMultiFetch)
 					return
 				}
 			}
 		}
 	}()
-	return &TxnCache{
-		store:          store,
-		lock:           lock,
-		fetch:          fetch,
-		multiFetch:     multiFetch,
-		multiKeyChan:   multiKeyChan,
-		execMultiFetch: execMultiFetch,
-	}, nil
 }
 
-func (tc *TxnCache) Get(key Key) Value {
-	if value, ok := tc.store.Load(key.Id()); ok {
+func (tc *txnCache) Get(key Key) Value {
+	if value, ok := tc.store.Load(key.ID()); ok {
 		return value
 	}
-	lock, _ := tc.lock.LoadOrStore(key.Id(), &sync.Mutex{})
+	lock, _ := tc.lock.LoadOrStore(key.ID(), &sync.Mutex{})
 	mutex := lock.(*sync.Mutex)
 	mutex.Lock()
 	defer mutex.Unlock()
-	if value, ok := tc.store.Load(key.Id()); ok {
+	if value, ok := tc.store.Load(key.ID()); ok {
 		return value
 	} else {
 		value := tc.fetch(key)
-		tc.store.Store(key.Id(), value)
+		if value == nil {
+			return tc.defVal
+		}
+		tc.store.Store(key.ID(), value)
 		return value
 	}
 }
 
-func (tc *TxnCache) MultiGet(keys []Key) map[Key]Value {
+func (tc *txnCache) MultiGet(keys []Key) map[Key]Value {
 	var data sync.Map
 	var wg sync.WaitGroup
 	var keyPush sync.WaitGroup
 	for _, key := range keys {
-		if value, ok := tc.store.Load(key.Id()); ok {
+		if value, ok := tc.store.Load(key.ID()); ok {
 			data.Store(key, value)
 			continue
 		}
 		wg.Add(1)
-		lock, _ := tc.lock.LoadOrStore(key.Id(), internal.NewMutex())
+		lock, _ := tc.lock.LoadOrStore(key.ID(), internal.NewMutex())
 		mutex := lock.(*internal.Mutex)
 		locked := mutex.TryLock()
 		keyPush.Add(1)
@@ -185,8 +210,38 @@ func (tc *TxnCache) MultiGet(keys []Key) map[Key]Value {
 	res := make(map[Key]Value)
 	wg.Wait()
 	data.Range(func(key, value interface{}) bool {
-		res[key.(Key)] = value.(Value)
+		res[key.(Key)] = value
 		return true
 	})
 	return res
+}
+
+func (tc *txnCache) GetAll() map[string]Value {
+	res := make(map[string]Value)
+	tc.store.Range(func(key, value interface{}) bool {
+		res[key.(string)] = value
+		return true
+	})
+	return res
+}
+
+func (tc *txnCache) Preload(preload map[string]Value) {
+	for k, v := range preload {
+		tc.store.Store(k, v)
+	}
+}
+
+func (tc *txnCache) DefaultValue(value Value) {
+	tc.defVal = value
+}
+
+func (tc *txnCache) CloseWithCtx(ctx context.Context) {
+	go func() {
+		<-ctx.Done()
+		tc.closeChan <- true
+	}()
+}
+
+func (tc *txnCache) Close() {
+	tc.closeChan <- true
 }
