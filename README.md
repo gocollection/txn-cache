@@ -1,4 +1,5 @@
 # Go Transaction Cache
+[![GoDoc][godoc-img]][godoc] [![Mit License][mit-img]][mit] [![Build Status][ci-img]][ci]
 
 **txncache** pkg helps reuse Fetch value of multiple keys during a single request handling.
 
@@ -106,3 +107,12 @@ avoid deadlock situation while waiting for these keys.
 ## Cache cleanup
 Cache should be closed post usage to avoid leaks, Close up can be done explicitly by calling **Close()** function or
 can be closed along with ctx cancellation by using **CloseWithCtx(context.Context)** function.
+
+[godoc-img]: https://godoc.org/github.com/gocollection/txn-cache?status.svg
+[godoc]: https://pkg.go.dev/github.com/gocollection/txn-cache?tab=doc
+
+[mit-img]: http://img.shields.io/badge/License-MIT-blue.svg
+[mit]: https://github.com/gocollection/txn-cache/blob/master/LICENSE
+
+[ci-img]: https://travis-ci.com/gocollection/txn-cache.svg?branch=master
+[ci]: https://travis-ci.com/github/gocollection/txn-cache/branches
