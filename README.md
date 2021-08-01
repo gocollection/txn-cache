@@ -106,7 +106,8 @@ avoid deadlock situation while waiting for these keys.
 
 ## Cache cleanup
 Cache should be closed post usage to avoid leaks, Close up can be done explicitly by calling **Close()** function or
-can be closed along with ctx cancellation by using **CloseWithCtx(context.Context)** function.
+can be closed along with ctx cancellation by using **CloseWithCtx(context.Context)** function. **CloseAfter(time.Duration)**
+guarantees cache cleanup after specified time.
 
 [godoc-img]: https://godoc.org/github.com/gocollection/txn-cache?status.svg
 [godoc]: https://pkg.go.dev/github.com/gocollection/txn-cache?tab=doc
