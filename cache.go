@@ -3,26 +3,26 @@ package txncache
 import (
 	"context"
 	"fmt"
-	"github.com/saurav534/txn-cache/internal"
+	"github.com/gocollection/txn-cache/internal/pkg/lock"
 	"sync"
 	"time"
 )
 
 type txnCache struct {
-	store          *sync.Map
-	lock           *sync.Map
-	fetch          Fetch
-	multiFetch     MultiFetch
-	defVal         Value
-	cacheDef       bool
-	args           []interface{}
-	batchSize      int
-	multiKeyChan   chan Key
-	execMultiFetch chan bool
-	closeChan      chan bool
-	cleanup        *sync.Once
-	calls          *sync.WaitGroup
-	closed         bool
+	store          *sync.Map       // cache entries to be stored here
+	lock           *sync.Map       // read-write lock per key
+	fetch          Fetch           // fetch function
+	multiFetch     MultiFetch      // multi fetch function or bulk fetch
+	defVal         Value           // default value
+	cacheDef       bool            // caching of default value
+	args           []interface{}   // common args to call fetch functions
+	batchSize      int             // batch size for per batch call to multiFetch function
+	attemptKey     chan Key        // keys to be pushed on channel to make fetch attempt
+	execMultiFetch chan bool       // force cache to fetch values for current keys in line
+	closeChan      chan bool       // close the cache process and clean the remaining
+	cleanup        *sync.Once      // cleanup allow closeup only once
+	calls          *sync.WaitGroup // action number of cache calls in progress
+	closed         bool            // if the cache has been closed
 }
 
 // NewCache gives an instance of txnCache for given fetch & multiFetch functions
@@ -71,7 +71,7 @@ func NewCache(fetch Fetch, multiFetch MultiFetch, batchSize int) (Cache, error) 
 		lock:           &sync.Map{},
 		fetch:          fetch,
 		multiFetch:     multiFetch,
-		multiKeyChan:   make(chan Key),
+		attemptKey:     make(chan Key),
 		defVal:         struct{}{},
 		batchSize:      batchSize,
 		execMultiFetch: make(chan bool),
@@ -79,12 +79,16 @@ func NewCache(fetch Fetch, multiFetch MultiFetch, batchSize int) (Cache, error) 
 		cleanup:        &sync.Once{},
 		calls:          &sync.WaitGroup{},
 	}
+	// starting cache setup
 	cache.setup()
 	return cache, nil
 }
 
 func (tc *txnCache) setup() {
+	// unique keys to make attempt  for
 	uniqueKeys := make([]Key, 0)
+
+	// execute function to fetch values for given keys
 	execute := func(keys []Key) {
 		mf := tc.multiFetch(keys, tc.args...)
 		for _, k := range keys {
@@ -99,85 +103,80 @@ func (tc *txnCache) setup() {
 				tc.store.Store(k.ID(), v)
 			}
 			if rw, ok := tc.lock.Load(k.ID()); ok {
-				(rw.(*internal.RWMutex)).Unlock()
+				(rw.(*lock.RWMutex)).Unlock()
 			}
 		}
 	}
-	setup := make(chan bool)
 	go func() {
 		for {
 			select {
-			case key := <-tc.multiKeyChan:
+			case <-tc.execMultiFetch: // force fetch execution
+				{
+					go execute(uniqueKeys)
+					uniqueKeys = nil
+				}
+			case key := <-tc.attemptKey: // a new key arrives to attempt for
 				{
 					uniqueKeys = append(uniqueKeys, key)
+					// if the key count if equal to batch size, call execute
 					if tc.batchSize > 0 && tc.batchSize == len(uniqueKeys) {
 						go execute(uniqueKeys)
 						uniqueKeys = nil
 					}
 				}
-			case <-tc.execMultiFetch:
-				{
-					go execute(uniqueKeys)
-					uniqueKeys = nil
-				}
-			case <-tc.closeChan:
+			case <-tc.closeChan: // cache close signal
 				{
 					finalClose := make(chan bool)
+					// handle calls in progress
 					go func() {
 						for {
 							select {
-							case key := <-tc.multiKeyChan:
-								{
-									uniqueKeys = append(uniqueKeys, key)
-								}
-							case <-tc.execMultiFetch:
+							case <-tc.execMultiFetch: // post closeup no op on exec
 								{
 									for _, k := range uniqueKeys {
 										if rw, ok := tc.lock.Load(k.ID()); ok {
-											(rw.(*internal.RWMutex)).Unlock()
+											(rw.(*lock.RWMutex)).Unlock()
 										}
 									}
 									uniqueKeys = nil
 								}
-							case <-finalClose:
+							case key := <-tc.attemptKey: // batching ignored post closeup
+								{
+									uniqueKeys = append(uniqueKeys, key)
+								}
+							case <-finalClose: // returns from for loop after all the calls are done
 								{
 									return
 								}
 							}
 						}
 					}()
+					// close call waits for all the running get calls to get completed
+					// all the new unique keys are digested and no op is performed on exec
 					tc.calls.Wait()
 					finalClose <- true
 					return
 				}
-			case <-setup:
-				{
-					continue
-				}
 			}
 		}
 	}()
-	setup <- true
-	return
 }
 
 func (tc *txnCache) Get(key Key) Value {
 	tc.calls.Add(1)
 	defer tc.calls.Done()
-	if value, ok := tc.store.Load(key.ID()); ok {
+	if value, ok := tc.store.Load(key.ID()); ok { // cache hit
 		return value
 	}
-	keyRWMutex, _ := tc.lock.LoadOrStore(key.ID(), internal.NewRWMutex())
-	rwMutex := keyRWMutex.(*internal.RWMutex)
-	rwMutex.RLock()
-	if value, ok := tc.store.Load(key.ID()); ok {
-		defer rwMutex.RUnlock()
-		return value
-	} else {
-		rwMutex.RUnlock()
-		rwMutex.Lock()
+	keyRWMutex, _ := tc.lock.LoadOrStore(key.ID(), lock.NewRWMutex())
+	rwMutex := keyRWMutex.(*lock.RWMutex)
+	locked := rwMutex.TryLock()
+	if locked {
 		defer rwMutex.Unlock()
-		value := tc.fetch(key)
+		if value, ok := tc.store.Load(key.ID()); ok { // cache hit after lock acquired
+			return value
+		}
+		value := tc.fetch(key, tc.args...)
 		if value == nil {
 			if tc.cacheDef {
 				value = tc.defVal
@@ -187,11 +186,18 @@ func (tc *txnCache) Get(key Key) Value {
 		}
 		tc.store.Store(key.ID(), value)
 		return value
+	} else {
+		rwMutex.RLock()
+		defer rwMutex.RUnlock()
+		if value, ok := tc.store.Load(key.ID()); ok {
+			return value
+		}
+		return tc.defVal
 	}
 }
 
 func (tc *txnCache) MultiGet(keys []Key) map[Key]Value {
-	if tc.closed {
+	if tc.closed { // if cache is already closed
 		return map[Key]Value{}
 	}
 	tc.calls.Add(1)
@@ -199,16 +205,19 @@ func (tc *txnCache) MultiGet(keys []Key) map[Key]Value {
 	var data sync.Map
 	var wg sync.WaitGroup
 	var keyPush sync.WaitGroup
+	// key will either be a hit in the cache entry or
+	// will first in queue to attempt for fetch or
+	// will wait for an existing fetch attempt to get completed
 	for _, key := range keys {
-		if value, ok := tc.store.Load(key.ID()); ok {
+		if value, ok := tc.store.Load(key.ID()); ok { // cache hit
 			data.Store(key, value)
 			continue
 		}
-		keyRWMutex, _ := tc.lock.LoadOrStore(key.ID(), internal.NewRWMutex())
-		rwMutex := keyRWMutex.(*internal.RWMutex)
-		locked := rwMutex.TryLock()
+		keyRWMutex, _ := tc.lock.LoadOrStore(key.ID(), lock.NewRWMutex())
+		rwMutex := keyRWMutex.(*lock.RWMutex)
+		locked := rwMutex.TryLock() // non blocking, if already locked it will wait to read the value
 		if locked {
-			if value, ok := tc.store.Load(key.ID()); ok {
+			if value, ok := tc.store.Load(key.ID()); ok { // cache hit after lock acquired
 				data.Store(key, value)
 				rwMutex.Unlock()
 				continue
@@ -216,23 +225,23 @@ func (tc *txnCache) MultiGet(keys []Key) map[Key]Value {
 		}
 		wg.Add(1)
 		keyPush.Add(1)
-		go func(k Key, kwg *internal.RWMutex, locked bool) {
+		go func(k Key, kwg *lock.RWMutex, locked bool) {
 			defer wg.Done()
 			if locked {
-				tc.multiKeyChan <- k
+				tc.attemptKey <- k // adding key for fetch call
 			}
 			keyPush.Done()
-			kwg.RLock()
+			kwg.RLock() // waiting to read the set value
 			defer kwg.RUnlock()
 			if value, ok := tc.store.Load(k.ID()); ok {
 				data.Store(k, value)
 			} else {
-				data.Store(k, tc.defVal)
+				data.Store(k, tc.defVal) // default value is returned if no value found in cache
 			}
 		}(key, rwMutex, locked)
 	}
-	keyPush.Wait()
-	tc.execMultiFetch <- true
+	keyPush.Wait()            // waiting for all the miss keys for their appropriate efforts
+	tc.execMultiFetch <- true // forcing cache to execute fetch to unblock this call asap
 	res := make(map[Key]Value)
 	wg.Wait()
 	data.Range(func(key, value interface{}) bool {

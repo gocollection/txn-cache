@@ -1,4 +1,4 @@
-package internal
+package lock
 
 type RWMutex struct {
 	write   chan struct{}
@@ -16,14 +16,14 @@ func NewRWMutex() *RWMutex {
 	}
 }
 
-func (l RWMutex) Lock() {
+func (l *RWMutex) Lock() {
 	l.write <- struct{}{}
 }
-func (l RWMutex) Unlock() {
+func (l *RWMutex) Unlock() {
 	<-l.write
 }
 
-func (l RWMutex) RLock() {
+func (l *RWMutex) RLock() {
 	// Count current readers. Default to 0.
 	var rs int
 	// Select on the channels without default.
@@ -45,7 +45,7 @@ func (l RWMutex) RLock() {
 	l.readers <- rs
 }
 
-func (l RWMutex) RUnlock() {
+func (l *RWMutex) RUnlock() {
 	// Take the value of readers and decrement it.
 	rs := <-l.readers
 	rs--
@@ -61,7 +61,7 @@ func (l RWMutex) RUnlock() {
 	l.readers <- rs
 }
 
-func (l RWMutex) TryLock() bool {
+func (l *RWMutex) TryLock() bool {
 	select {
 	case l.write <- struct{}{}:
 		return true
@@ -70,7 +70,7 @@ func (l RWMutex) TryLock() bool {
 	}
 }
 
-func (l RWMutex) TryRLock() bool {
+func (l *RWMutex) TryRLock() bool {
 	var rs int
 	select {
 	case l.write <- struct{}{}:

@@ -1,3 +1,3 @@
-module github.com/saurav534/txn-cache
+module github.com/gocollection/txn-cache
 
 go 1.13
